@@ -1,4 +1,4 @@
-// server.js (Updated with SQLite Database and Admin Endpoint)
+// server.js (FINAL VERSION - Using Knex with PostgreSQL)
 
 import { GoogleGenAI } from '@google/genai';
 import express from 'express';
@@ -6,8 +6,7 @@ import cors from 'cors';
 import 'dotenv/config'; 
 import path from 'path';
 import { fileURLToPath } from 'url';
-import sqlite3 from 'sqlite3'; // Import the sqlite3 library
-import { open } from 'sqlite';   // Import the open function
+import knex from 'knex'; // New: Import Knex
 
 // --- File Path Setup ---
 const __filename = fileURLToPath(import.meta.url);
@@ -16,28 +15,40 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const port = 3000;
 
-let db; // Global variable to hold the database connection
+let db; // Global variable to hold the Knex database connection
 
-// --- Database Setup and Initialization ---
+// --- Database Setup and Initialization (Uses process.env.DATABASE_URL) ---
 async function initializeDatabase() {
-    try {
-        db = await open({
-            filename: path.join(__dirname, 'chat_history.db'), // Database file path
-            driver: sqlite3.Database
-        });
+    // Configuration for PostgreSQL
+    const config = {
+        client: 'pg', 
+        connection: process.env.DATABASE_URL, // Provided by hosting platform (Railway/Render)
+        // Ensure SSL is used for external connections (required by most hosts)
+        ssl: { rejectUnauthorized: false } 
+    };
 
-        // Create the messages table if it doesn't exist
-        await db.exec(`
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sender TEXT NOT NULL,
-                message TEXT NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
-        console.log("Database initialized and 'messages' table ensured.");
+    db = knex(config);
+
+    try {
+        // Test the database connection
+        await db.raw('SELECT 1+1 AS result'); 
+        console.log("Database initialized and PostgreSQL connection successful.");
+        
+        // Create the 'messages' table if it doesn't exist (Knex Schema Builder)
+        const tableExists = await db.schema.hasTable('messages');
+        if (!tableExists) {
+            await db.schema.createTable('messages', (table) => {
+                table.increments('id').primary();
+                table.string('sender', 50).notNullable(); // Sender name
+                table.text('message').notNullable(); // Message content
+                table.timestamp('timestamp').defaultTo(db.fn.now());
+            });
+            console.log("PostgreSQL 'messages' table created.");
+        }
+
     } catch (error) {
         console.error("Database Initialization Error:", error);
+        throw new Error("Failed to connect to PostgreSQL database. Check DATABASE_URL.");
     }
 }
 
@@ -47,7 +58,8 @@ async function saveMessage(sender, message) {
         console.error("Database connection not established.");
         return;
     }
-    await db.run('INSERT INTO messages (sender, message) VALUES (?, ?)', [sender, message]);
+    // Knex insert syntax
+    await db('messages').insert({ sender: sender, message: message });
 }
 
 // --- Gemini API Setup ---
@@ -94,41 +106,36 @@ app.use(express.json());
 
 // --- API ENDPOINT: Chat Communication (Saves to DB) ---
 app.post('/api/chat', async (req, res) => {
-    const { message, sender } = req.body; // Added sender from frontend for structure
-    const isUser = sender === 'user';
+    const { message, sender } = req.body; 
 
     if (!message) {
         return res.status(400).send({ error: "No message provided." });
     }
 
     try {
-        // Save user message immediately
         await saveMessage('User', message);
         
-        // Get bot response
         const botResponseText = await sendMessageWithRetry(message);
         
-        // Save bot message
         await saveMessage('Bot', botResponseText);
 
-        // Send the response back to the frontend
         res.json({ botResponse: botResponseText });
 
     } catch (error) {
-        console.error("Gemini API Error:", error);
+        console.error("Server Error during Chat:", error);
         await saveMessage('System Error', `Failed to get Gemini response for: ${message}`);
-        res.status(500).send({ error: "Failed to communicate with the AI model. Try refreshing the page." });
+        res.status(500).send({ error: "Internal server error. Please try again." });
     }
 });
 
-// --- NEW ADMIN ENDPOINT: Get All Conversations ---
+// --- ADMIN ENDPOINT: Get All Conversations ---
 app.get('/api/admin/conversations', async (req, res) => {
     if (!db) {
         return res.status(503).send({ error: "Database not ready." });
     }
     try {
-        // Fetch all messages, ordered by timestamp
-        const messages = await db.all('SELECT * FROM messages ORDER BY timestamp ASC');
+        // Knex select syntax
+        const messages = await db.select('*').from('messages').orderBy('timestamp', 'asc');
         res.json(messages);
     } catch (error) {
         console.error("Admin Endpoint Error:", error);
@@ -142,17 +149,20 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// New endpoint for the admin page
 app.get('/admin', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'admin.html'));
 });
 
 
 // --- Start Server and Initialize DB ---
+// NOTE: We need to set up the DB before starting the server.
 initializeDatabase().then(() => {
-    app.listen(port, () => {
-        console.log(`Server running at http://localhost:${port}`);
-        console.log(`Chatbot: http://localhost:${port}`);
-        console.log(`Admin Page: http://localhost:${port}/admin`);
+    // Only set the PORT environment variable locally for testing
+    const actualPort = process.env.PORT || port; 
+    
+    app.listen(actualPort, () => {
+        console.log(`Server running on port ${actualPort}`);
+        console.log(`Chatbot: http://localhost:${actualPort}`);
+        console.log(`Admin Page: http://localhost:${actualPort}/admin`);
     });
 });
