@@ -1,168 +1,143 @@
-// server.js (FINAL VERSION - Using Knex with PostgreSQL)
+// server.js (Updated with Railway PORT support + SQLite + Gemini AI)
 
 import { GoogleGenAI } from '@google/genai';
 import express from 'express';
 import cors from 'cors';
-import 'dotenv/config'; 
+import 'dotenv/config';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import knex from 'knex'; // New: Import Knex
+import sqlite3 from 'sqlite3';
+import { open } from 'sqlite';
 
 // --- File Path Setup ---
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const port = 3000;
 
-let db; // Global variable to hold the Knex database connection
+// IMPORTANT: Railway needs this! (Fix)
+const port = process.env.PORT || 3000;
 
-// --- Database Setup and Initialization (Uses process.env.DATABASE_URL) ---
+let db; // SQLite database instance
+
+// --- Database Setup and Initialization ---
 async function initializeDatabase() {
-    // Configuration for PostgreSQL
-    const config = {
-        client: 'pg', 
-        connection: process.env.DATABASE_URL, // Provided by hosting platform (Railway/Render)
-        // Ensure SSL is used for external connections (required by most hosts)
-        ssl: { rejectUnauthorized: false } 
-    };
-
-    db = knex(config);
-
     try {
-        // Test the database connection
-        await db.raw('SELECT 1+1 AS result'); 
-        console.log("Database initialized and PostgreSQL connection successful.");
-        
-        // Create the 'messages' table if it doesn't exist (Knex Schema Builder)
-        const tableExists = await db.schema.hasTable('messages');
-        if (!tableExists) {
-            await db.schema.createTable('messages', (table) => {
-                table.increments('id').primary();
-                table.string('sender', 50).notNullable(); // Sender name
-                table.text('message').notNullable(); // Message content
-                table.timestamp('timestamp').defaultTo(db.fn.now());
-            });
-            console.log("PostgreSQL 'messages' table created.");
-        }
+        db = await open({
+            filename: path.join(__dirname, 'chat_history.db'),
+            driver: sqlite3.Database
+        });
 
+        await db.exec(`
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender TEXT NOT NULL,
+                message TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        console.log("Database initialized and 'messages' table ensured.");
     } catch (error) {
         console.error("Database Initialization Error:", error);
-        throw new Error("Failed to connect to PostgreSQL database. Check DATABASE_URL.");
     }
 }
 
-// Function to save messages to the database
+// Save message to DB
 async function saveMessage(sender, message) {
     if (!db) {
-        console.error("Database connection not established.");
+        console.error("Database not initialized.");
         return;
     }
-    // Knex insert syntax
-    await db('messages').insert({ sender: sender, message: message });
+    await db.run('INSERT INTO messages (sender, message) VALUES (?, ?)', [sender, message]);
 }
 
 // --- Gemini API Setup ---
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) {
-    throw new Error("GEMINI_API_KEY is not set in the .env file.");
+    throw new Error("GEMINI_API_KEY is missing in .env");
 }
+
 const ai = new GoogleGenAI(apiKey);
 
-// Initialize chat session (Holds conversation context)
+// Chat session (keeps context)
 const chat = ai.chats.create({
     model: "gemini-2.5-flash",
     config: {
-        systemInstruction: "You are a sassy, funny, and slightly dramatic Artificial Intelligence assistant named 'Birthday Bot' dedicated to delivering a secret birthday message to the user. You MUST maintain the personality of a gatekeeper that tests the user with questions about their friendship. If the user answers a free-form question correctly, praise them humorously. If they answer incorrectly or go off-topic, mock them lightly and steer them back to the current structured task. Keep your answers brief and conversational.",
+        systemInstruction:
+            "You are a sassy, funny, dramatic AI named 'Birthday Bot'. You test the user with friendship questions. Praise good answers humorously, mock wrong ones lightly. Keep responses short."
     }
 });
 
-// --- HELPER FUNCTION: Send Message with Automated Retries ---
+// --- Helper: Retry Gemini API on temporary errors ---
 async function sendMessageWithRetry(message, retries = 3) {
     for (let i = 0; i < retries; i++) {
         try {
-            const result = await chat.sendMessage({message: message});
+            const result = await chat.sendMessage({ message });
             return result.text;
         } catch (error) {
             if (error.status === 503 || error.status === 500) {
-                console.warn(`Gemini temporary error (${error.status}). Retrying in ${2 ** i} seconds...`);
-                if (i < retries - 1) { 
-                     await new Promise(resolve => setTimeout(resolve, (2 ** i) * 1000));
-                }
+                console.warn(`Gemini Error ${error.status}. Retrying in ${2 ** i}s...`);
+                await new Promise(res => setTimeout(res, (2 ** i) * 1000));
             } else {
-                throw error; 
+                throw error;
             }
         }
     }
-    throw new Error("Gemini service unavailable after multiple retries.");
+    throw new Error("Gemini service unavailable after retries.");
 }
 
-
 // --- Middleware ---
-app.use(cors()); 
-app.use(express.static(path.join(__dirname, 'public')));
-app.use(express.json()); 
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
 
-
-// --- API ENDPOINT: Chat Communication (Saves to DB) ---
+// --- Chat Endpoint ---
 app.post('/api/chat', async (req, res) => {
-    const { message, sender } = req.body; 
+    const { message, sender } = req.body;
 
-    if (!message) {
-        return res.status(400).send({ error: "No message provided." });
-    }
+    if (!message) return res.status(400).json({ error: "Message is required." });
 
     try {
-        await saveMessage('User', message);
-        
-        const botResponseText = await sendMessageWithRetry(message);
-        
-        await saveMessage('Bot', botResponseText);
+        await saveMessage(sender || "User", message);
 
-        res.json({ botResponse: botResponseText });
+        const botReply = await sendMessageWithRetry(message);
 
+        await saveMessage("Bot", botReply);
+
+        res.json({ botResponse: botReply });
     } catch (error) {
-        console.error("Server Error during Chat:", error);
-        await saveMessage('System Error', `Failed to get Gemini response for: ${message}`);
-        res.status(500).send({ error: "Internal server error. Please try again." });
+        console.error("Chat Error:", error);
+        await saveMessage("System", "Gemini failure during reply.");
+        res.status(500).json({ error: "AI model failed. Try again." });
     }
 });
 
-// --- ADMIN ENDPOINT: Get All Conversations ---
+// --- Admin Endpoint ---
 app.get('/api/admin/conversations', async (req, res) => {
-    if (!db) {
-        return res.status(503).send({ error: "Database not ready." });
-    }
     try {
-        // Knex select syntax
-        const messages = await db.select('*').from('messages').orderBy('timestamp', 'asc');
+        const messages = await db.all("SELECT * FROM messages ORDER BY timestamp ASC");
         res.json(messages);
     } catch (error) {
-        console.error("Admin Endpoint Error:", error);
-        res.status(500).send({ error: "Could not retrieve conversations." });
+        console.error("Admin Fetch Error:", error);
+        res.status(500).json({ error: "Could not fetch conversations." });
     }
 });
 
-
-// --- Serve HTML Files ---
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+// --- Serve Frontend Pages ---
+app.get("/", (req, res) => {
+    res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-app.get('/admin', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'admin.html'));
+app.get("/admin", (req, res) => {
+    res.sendFile(path.join(__dirname, "public", "admin.html"));
 });
 
-
-// --- Start Server and Initialize DB ---
-// NOTE: We need to set up the DB before starting the server.
+// --- Start Server ---
 initializeDatabase().then(() => {
-    // Only set the PORT environment variable locally for testing
-    const actualPort = process.env.PORT || port; 
-    
-    app.listen(actualPort, () => {
-        console.log(`Server running on port ${actualPort}`);
-        console.log(`Chatbot: http://localhost:${actualPort}`);
-        console.log(`Admin Page: http://localhost:${actualPort}/admin`);
+    app.listen(port, () => {
+        console.log(`🚀 Server running on port ${port}`);
+        console.log(`Chatbot UI: http://localhost:${port}`);
+        console.log(`Admin Panel: http://localhost:${port}/admin`);
     });
 });
